@@ -1,4 +1,4 @@
-// App.tsx — Navigation setup (Master-Detail pattern)
+// App.tsx — Navigation setup (Master-Detail)
 
 import React from "react";
 import { StatusBar } from "expo-status-bar";
@@ -8,7 +8,6 @@ import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import RideListScreen from "./screens/RideListScreen";
 import RideDetailScreen from "./screens/RideDetailScreen";
 
-// Route params for the stack navigator
 export type RootStackParamList = {
   RideList: undefined;
   RideDetail: {
@@ -31,21 +30,19 @@ export default function App(): React.JSX.Element {
   return (
     <>
       <StatusBar style="light" />
-
       <NavigationContainer>
         <Stack.Navigator
           initialRouteName="RideList"
           screenOptions={{
-            headerStyle: { backgroundColor: "#1a1a2e" },
-            headerTintColor: "#e0e0e0",
-            headerTitleStyle: { fontWeight: "700" },
-            contentStyle: { backgroundColor: "#16213e" },
+            headerStyle: { backgroundColor: "#121212" },
+            headerTintColor: "#fff",
+            contentStyle: { backgroundColor: "#121212" },
           }}
         >
           <Stack.Screen
             name="RideList"
             component={RideListScreen}
-            options={{ title: "RideCluj" }}
+            options={{ title: "Rides" }}
           />
           <Stack.Screen
             name="RideDetail"
