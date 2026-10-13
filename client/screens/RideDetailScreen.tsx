@@ -1,19 +1,6 @@
-/**
- * ============================================================================
- *  RideCluj — RideDetailScreen.tsx (DETAIL Screen)
- * ============================================================================
- *
- *  ── RUBRIC #2: Master-Detail UI (Detail half) ──
- *  This is the DETAIL screen. It displays full information about a single
- *  ride that was selected from the Master screen (RideListScreen).
- *
- *  ── RUBRIC #4: WebSocket Server-Side Notifications ──
- *  On mount, this screen connects to the Socket.io server and listens for
- *  the NEW_HAZARD_ALERT event. When the server pushes a hazard notification,
- *  it is displayed using React Native's Alert dialog AND appended to an
- *  on-screen log so the user can see all received alerts.
- * ============================================================================
- */
+// RideDetailScreen.tsx — Detail screen
+// Displays full info for a selected ride.
+// Connects to WebSocket to receive real-time hazard alerts from the server.
 
 import React, { useEffect, useState, useRef } from "react";
 import {
@@ -27,19 +14,8 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import type { RootStackParamList } from "../App";
 import { io, Socket } from "socket.io-client";
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-/**
- * ⚠️  IMPORTANT: Must match the backend server address.
- * Replace "localhost" with your machine's local network IP for physical devices.
- */
-const SOCKET_URL = "http://localhost:3000";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+// Must match the backend server address
+const SOCKET_URL = "http://192.168.0.59:8080";
 
 interface HazardAlert {
   id: number;
@@ -52,23 +28,6 @@ interface HazardAlert {
 
 type Props = NativeStackScreenProps<RootStackParamList, "RideDetail">;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Emoji for hazard type */
-const hazardIcon = (type: HazardAlert["type"]): string => {
-  const icons: Record<HazardAlert["type"], string> = {
-    pothole: "🕳️",
-    dog: "🐕",
-    weather: "🌧️",
-    obstacle: "🚧",
-    traffic: "🚗",
-  };
-  return icons[type] ?? "⚠️";
-};
-
-/** Color for severity badge */
 const severityColor = (severity: HazardAlert["severity"]): string => {
   switch (severity) {
     case "low":
@@ -80,100 +39,61 @@ const severityColor = (severity: HazardAlert["severity"]): string => {
   }
 };
 
-/** Mode label */
 const modeLabel = (mode: string): string => {
   switch (mode) {
     case "mtb":
-      return "🏔️ MTB Trail";
+      return "MTB Trail";
     case "road":
-      return "🛣️ Road Ride";
+      return "Road Ride";
     case "commuter":
-      return "🏙️ City Commute";
+      return "City Commute";
     default:
       return mode;
   }
 };
 
-// ---------------------------------------------------------------------------
-// Component
-// ---------------------------------------------------------------------------
-
 export default function RideDetailScreen({ route }: Props) {
-  // The ride object passed from the Master screen
   const { ride } = route.params;
 
-  // Accumulated hazard alerts received via WebSocket
   const [alerts, setAlerts] = useState<HazardAlert[]>([]);
   const [socketConnected, setSocketConnected] = useState<boolean>(false);
-
-  // Ref to hold the socket instance for cleanup
   const socketRef = useRef<Socket | null>(null);
 
-  // --------------------------------------------------------------------------
-  // ── RUBRIC #4: WebSocket Server-Side Notifications ──
-  //
-  // We connect to the Socket.io server when this Detail screen mounts.
-  // We listen for the "NEW_HAZARD_ALERT" event. When received:
-  //   1. Show a React Native Alert dialog (immediate user notification).
-  //   2. Append the alert to the on-screen log for visibility.
-  //
-  // The connection is cleaned up when the user navigates back.
-  // --------------------------------------------------------------------------
+  // Connect to WebSocket on mount, listen for hazard alerts
   useEffect(() => {
-    console.log("[RideDetail] Connecting to WebSocket at", SOCKET_URL);
-
     const socket = io(SOCKET_URL, {
-      transports: ["websocket"], // Use WebSocket transport (Expo Go compatible)
+      transports: ["websocket"],
     });
 
     socketRef.current = socket;
 
     socket.on("connect", () => {
-      console.log("[RideDetail] WebSocket connected:", socket.id);
       setSocketConnected(true);
     });
 
     socket.on("disconnect", () => {
-      console.log("[RideDetail] WebSocket disconnected");
       setSocketConnected(false);
     });
 
-    /**
-     * ── RUBRIC #4: Receiving the server-side push notification ──
-     *
-     * The server emits NEW_HAZARD_ALERT every ~15 seconds.
-     * We handle it here by:
-     *   - Showing a native Alert dialog
-     *   - Adding it to the on-screen alerts list
-     */
+    // Handle incoming hazard alerts from the server
     socket.on("NEW_HAZARD_ALERT", (alert: HazardAlert) => {
-      console.log("[RideDetail] Received hazard alert:", alert.message);
-
-      // 1. Show a React Native Alert dialog
       Alert.alert(
-        `${hazardIcon(alert.type)} Hazard Alert`,
-        `${alert.message}\n\n📍 ${alert.location}\n⚠️ Severity: ${alert.severity.toUpperCase()}`,
+        "Hazard Alert",
+        `${alert.message}\n\nLocation: ${alert.location}\nSeverity: ${alert.severity.toUpperCase()}`,
         [{ text: "OK", style: "default" }]
       );
 
-      // 2. Append to the on-screen log
       setAlerts((prev) => [alert, ...prev]);
     });
 
-    // Cleanup: disconnect socket when leaving the screen
     return () => {
-      console.log("[RideDetail] Cleaning up WebSocket connection");
       socket.disconnect();
     };
   }, []);
 
-  // --------------------------------------------------------------------------
-  // Render
-  // --------------------------------------------------------------------------
-
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      {/* ── Ride Info Section ── */}
+      {/* Ride info */}
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Ride Information</Text>
 
@@ -181,7 +101,7 @@ export default function RideDetailScreen({ route }: Props) {
           <InfoRow label="Mode" value={modeLabel(ride.mode)} />
           <InfoRow label="Route" value={ride.route} />
           <InfoRow label="Distance" value={`${ride.distance_km} km`} />
-          <InfoRow label="Riders" value={`${ride.riders} riders`} />
+          <InfoRow label="Riders" value={`${ride.riders}`} />
           <InfoRow label="Status" value={ride.status.replace("_", " ").toUpperCase()} />
           <InfoRow
             label="Start Time"
@@ -190,7 +110,7 @@ export default function RideDetailScreen({ route }: Props) {
         </View>
       </View>
 
-      {/* ── WebSocket Status ── */}
+      {/* WebSocket connection status */}
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Live Hazard Feed</Text>
 
@@ -203,18 +123,13 @@ export default function RideDetailScreen({ route }: Props) {
           />
           <Text style={styles.connectionText}>
             {socketConnected
-              ? "Connected — listening for hazard alerts"
-              : "Connecting to live feed..."}
+              ? "Connected"
+              : "Connecting..."}
           </Text>
         </View>
-
-        <Text style={styles.hintText}>
-          💡 The server sends a random hazard alert every ~15 seconds.
-          Stay on this screen to see them appear below and as Alert dialogs.
-        </Text>
       </View>
 
-      {/* ── Hazard Alerts Log ── */}
+      {/* Received alerts */}
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>
           Received Alerts ({alerts.length})
@@ -222,15 +137,12 @@ export default function RideDetailScreen({ route }: Props) {
 
         {alerts.length === 0 ? (
           <Text style={styles.emptyText}>
-            No alerts received yet. Wait for the server to push one...
+            No alerts received yet.
           </Text>
         ) : (
           alerts.map((alert) => (
             <View key={alert.id} style={styles.alertCard}>
               <View style={styles.alertHeader}>
-                <Text style={styles.alertIcon}>
-                  {hazardIcon(alert.type)}
-                </Text>
                 <Text style={styles.alertType}>
                   {alert.type.toUpperCase()}
                 </Text>
@@ -246,7 +158,7 @@ export default function RideDetailScreen({ route }: Props) {
                 </View>
               </View>
               <Text style={styles.alertMessage}>{alert.message}</Text>
-              <Text style={styles.alertLocation}>📍 {alert.location}</Text>
+              <Text style={styles.alertLocation}>{alert.location}</Text>
               <Text style={styles.alertTime}>
                 {new Date(alert.reported_at).toLocaleTimeString()}
               </Text>
@@ -258,10 +170,6 @@ export default function RideDetailScreen({ route }: Props) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Info Row Sub-component
-// ---------------------------------------------------------------------------
-
 function InfoRow({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.infoRow}>
@@ -270,10 +178,6 @@ function InfoRow({ label, value }: { label: string; value: string }) {
     </View>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Styles
-// ---------------------------------------------------------------------------
 
 const styles = StyleSheet.create({
   container: {
@@ -284,8 +188,6 @@ const styles = StyleSheet.create({
     padding: 16,
     paddingBottom: 48,
   },
-
-  // ── Sections ──
   section: {
     marginBottom: 24,
   },
@@ -295,8 +197,6 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     marginBottom: 12,
   },
-
-  // ── Info Card ──
   infoCard: {
     backgroundColor: "#1a1a2e",
     borderRadius: 12,
@@ -324,8 +224,6 @@ const styles = StyleSheet.create({
     textAlign: "right",
     maxWidth: "60%",
   },
-
-  // ── Connection Badge ──
   connectionBadge: {
     flexDirection: "row",
     alignItems: "center",
@@ -344,15 +242,6 @@ const styles = StyleSheet.create({
     color: "#a0a0b0",
     fontSize: 14,
   },
-  hintText: {
-    color: "#6a6a8a",
-    fontSize: 13,
-    fontStyle: "italic",
-    marginTop: 4,
-    lineHeight: 18,
-  },
-
-  // ── Alert Cards ──
   alertCard: {
     backgroundColor: "#1a1a2e",
     borderRadius: 10,
@@ -365,10 +254,6 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     marginBottom: 6,
-  },
-  alertIcon: {
-    fontSize: 20,
-    marginRight: 8,
   },
   alertType: {
     color: "#e0e0e0",
@@ -402,8 +287,6 @@ const styles = StyleSheet.create({
     fontSize: 11,
     textAlign: "right",
   },
-
-  // ── Empty State ──
   emptyText: {
     color: "#6a6a8a",
     fontSize: 14,
