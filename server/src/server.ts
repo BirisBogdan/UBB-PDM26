@@ -4,8 +4,7 @@ import express, { Request, Response } from "express";
 import http from "http";
 import cors from "cors";
 import { Server as SocketIOServer } from "socket.io";
-import fs from "fs";
-import path from "path";
+import { Pool } from "pg";
 
 interface Ride {
   id: number;
@@ -19,31 +18,47 @@ interface Ride {
 }
 
 // ── Enrollment persistence ──────────────────────────────────────────
-// Stores enrolled ride IDs in a JSON file so they survive server restarts.
+// Enrolled ride IDs are stored in PostgreSQL so they survive app and server restarts.
 
-const DATA_DIR = path.join(__dirname, "..", "data");
-const ENROLLMENTS_FILE = path.join(DATA_DIR, "enrollments.json");
+const pool = new Pool({
+  host: process.env.PGHOST || "localhost",
+  port: Number(process.env.PGPORT) || 5432,
+  database: process.env.PGDATABASE || "PDM",
+  user: process.env.PGUSER || "postgres",
+  password: process.env.PGPASSWORD || "password",
+});
 
-function loadEnrollments(): number[] {
-  try {
-    if (!fs.existsSync(ENROLLMENTS_FILE)) return [];
-    const raw = fs.readFileSync(ENROLLMENTS_FILE, "utf-8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+async function initDatabase(): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS enrollments (
+      ride_id INTEGER PRIMARY KEY,
+      enrolled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 }
 
-function saveEnrollments(enrollments: number[]): void {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  fs.writeFileSync(ENROLLMENTS_FILE, JSON.stringify(enrollments, null, 2));
+async function getEnrollments(): Promise<number[]> {
+  const result = await pool.query<{ ride_id: number }>(
+    "SELECT ride_id FROM enrollments ORDER BY enrolled_at"
+  );
+  return result.rows.map((row) => row.ride_id);
 }
 
-// In-memory cache, loaded from disk on startup
-let enrolledRideIds: number[] = loadEnrollments();
+async function isEnrolled(rideId: number): Promise<boolean> {
+  const result = await pool.query("SELECT 1 FROM enrollments WHERE ride_id = $1", [rideId]);
+  return (result.rowCount ?? 0) > 0;
+}
+
+async function enroll(rideId: number): Promise<void> {
+  await pool.query(
+    "INSERT INTO enrollments (ride_id) VALUES ($1) ON CONFLICT (ride_id) DO NOTHING",
+    [rideId]
+  );
+}
+
+async function unenroll(rideId: number): Promise<void> {
+  await pool.query("DELETE FROM enrollments WHERE ride_id = $1", [rideId]);
+}
 
 // Mock data
 const MOCK_RIDES: Ride[] = [
@@ -138,41 +153,57 @@ app.get("/api/health", (_req: Request, res: Response) => {
 // ── Enrollment REST endpoints ───────────────────────────────────────
 
 // Get all enrolled ride IDs
-app.get("/api/enrollments", (_req: Request, res: Response) => {
+app.get("/api/enrollments", async (_req: Request, res: Response) => {
   console.log("[REST] GET /api/enrollments");
-  res.json(enrolledRideIds);
+  try {
+    res.json(await getEnrollments());
+  } catch (err) {
+    console.error("[DB] Failed to read enrollments:", err);
+    res.status(500).json({ error: "Database error" });
+  }
 });
 
 // Check if enrolled in a specific ride
-app.get("/api/enrollments/:rideId", (req: Request, res: Response) => {
+app.get("/api/enrollments/:rideId", async (req: Request, res: Response) => {
   const rideId = Number(req.params.rideId);
-  const isEnrolled = enrolledRideIds.includes(rideId);
-  console.log(`[REST] GET /api/enrollments/${rideId} → ${isEnrolled}`);
-  res.json({ rideId, enrolled: isEnrolled });
+  try {
+    const enrolled = await isEnrolled(rideId);
+    console.log(`[REST] GET /api/enrollments/${rideId} → ${enrolled}`);
+    res.json({ rideId, enrolled });
+  } catch (err) {
+    console.error("[DB] Failed to read enrollment:", err);
+    res.status(500).json({ error: "Database error" });
+  }
 });
 
 // Enroll in a ride
-app.post("/api/enrollments", (req: Request, res: Response) => {
+app.post("/api/enrollments", async (req: Request, res: Response) => {
   const { rideId } = req.body as { rideId: number };
   if (!rideId) {
     res.status(400).json({ error: "rideId is required" });
     return;
   }
-  if (!enrolledRideIds.includes(rideId)) {
-    enrolledRideIds.push(rideId);
-    saveEnrollments(enrolledRideIds);
+  try {
+    await enroll(rideId);
     console.log(`[REST] POST /api/enrollments — enrolled in ride ${rideId}`);
+    res.json({ rideId, enrolled: true });
+  } catch (err) {
+    console.error("[DB] Failed to enroll:", err);
+    res.status(500).json({ error: "Database error" });
   }
-  res.json({ rideId, enrolled: true });
 });
 
 // Unenroll from a ride
-app.delete("/api/enrollments/:rideId", (req: Request, res: Response) => {
+app.delete("/api/enrollments/:rideId", async (req: Request, res: Response) => {
   const rideId = Number(req.params.rideId);
-  enrolledRideIds = enrolledRideIds.filter((id) => id !== rideId);
-  saveEnrollments(enrolledRideIds);
-  console.log(`[REST] DELETE /api/enrollments/${rideId} — unenrolled`);
-  res.json({ rideId, enrolled: false });
+  try {
+    await unenroll(rideId);
+    console.log(`[REST] DELETE /api/enrollments/${rideId} — unenrolled`);
+    res.json({ rideId, enrolled: false });
+  } catch (err) {
+    console.error("[DB] Failed to unenroll:", err);
+    res.status(500).json({ error: "Database error" });
+  }
 });
 
 // ── WebSocket — handles enrollment ──────────────────────────────────
@@ -180,10 +211,12 @@ io.on("connection", (socket) => {
   console.log("[WS] Client connected:", socket.id);
 
   // Client sends ENROLL with a ride id, server persists and confirms
-  socket.on("ENROLL", (data: { rideId: number }) => {
-    if (!enrolledRideIds.includes(data.rideId)) {
-      enrolledRideIds.push(data.rideId);
-      saveEnrollments(enrolledRideIds);
+  socket.on("ENROLL", async (data: { rideId: number }) => {
+    try {
+      await enroll(data.rideId);
+    } catch (err) {
+      console.error("[DB] Failed to enroll:", err);
+      return;
     }
     console.log(`[WS] Client ${socket.id} enrolled in ride ${data.rideId}`);
     socket.emit("ENROLL_CONFIRMED", {
@@ -193,9 +226,13 @@ io.on("connection", (socket) => {
   });
 
   // Client sends UNENROLL with a ride id, server persists and confirms
-  socket.on("UNENROLL", (data: { rideId: number }) => {
-    enrolledRideIds = enrolledRideIds.filter((id) => id !== data.rideId);
-    saveEnrollments(enrolledRideIds);
+  socket.on("UNENROLL", async (data: { rideId: number }) => {
+    try {
+      await unenroll(data.rideId);
+    } catch (err) {
+      console.error("[DB] Failed to unenroll:", err);
+      return;
+    }
     console.log(`[WS] Client ${socket.id} unenrolled from ride ${data.rideId}`);
     socket.emit("UNENROLL_CONFIRMED", {
       rideId: data.rideId,
@@ -209,9 +246,17 @@ io.on("connection", (socket) => {
 });
 
 // Start server
-httpServer.listen(PORT, "0.0.0.0", () => {
-  console.log(`\nServer running on http://0.0.0.0:${PORT}`);
-  console.log(`  REST API:  http://localhost:${PORT}/api/rides`);
-  console.log(`  Enrollments: http://localhost:${PORT}/api/enrollments`);
-  console.log(`  WebSocket: ws://localhost:${PORT}\n`);
-});
+initDatabase()
+  .then(() => {
+    console.log("[DB] Connected to PostgreSQL");
+    httpServer.listen(PORT, "0.0.0.0", () => {
+      console.log(`\nServer running on http://0.0.0.0:${PORT}`);
+      console.log(`  REST API:  http://localhost:${PORT}/api/rides`);
+      console.log(`  Enrollments: http://localhost:${PORT}/api/enrollments`);
+      console.log(`  WebSocket: ws://localhost:${PORT}\n`);
+    });
+  })
+  .catch((err) => {
+    console.error("[DB] Could not connect to PostgreSQL:", err);
+    process.exit(1);
+  });
