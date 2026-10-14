@@ -4,6 +4,8 @@ import express, { Request, Response } from "express";
 import http from "http";
 import cors from "cors";
 import { Server as SocketIOServer } from "socket.io";
+import fs from "fs";
+import path from "path";
 
 interface Ride {
   id: number;
@@ -15,6 +17,33 @@ interface Ride {
   start_time: string;
   status: "waiting" | "in_progress" | "completed";
 }
+
+// ── Enrollment persistence ──────────────────────────────────────────
+// Stores enrolled ride IDs in a JSON file so they survive server restarts.
+
+const DATA_DIR = path.join(__dirname, "..", "data");
+const ENROLLMENTS_FILE = path.join(DATA_DIR, "enrollments.json");
+
+function loadEnrollments(): number[] {
+  try {
+    if (!fs.existsSync(ENROLLMENTS_FILE)) return [];
+    const raw = fs.readFileSync(ENROLLMENTS_FILE, "utf-8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveEnrollments(enrollments: number[]): void {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  fs.writeFileSync(ENROLLMENTS_FILE, JSON.stringify(enrollments, null, 2));
+}
+
+// In-memory cache, loaded from disk on startup
+let enrolledRideIds: number[] = loadEnrollments();
 
 // Mock data
 const MOCK_RIDES: Ride[] = [
@@ -86,7 +115,7 @@ const io = new SocketIOServer(httpServer, {
   },
 });
 
-// REST endpoints
+// ── REST endpoints ──────────────────────────────────────────────────
 
 app.get("/api/rides", (_req: Request, res: Response) => {
   console.log("[REST] GET /api/rides");
@@ -106,16 +135,71 @@ app.get("/api/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// WebSocket — handles enrollment
+// ── Enrollment REST endpoints ───────────────────────────────────────
+
+// Get all enrolled ride IDs
+app.get("/api/enrollments", (_req: Request, res: Response) => {
+  console.log("[REST] GET /api/enrollments");
+  res.json(enrolledRideIds);
+});
+
+// Check if enrolled in a specific ride
+app.get("/api/enrollments/:rideId", (req: Request, res: Response) => {
+  const rideId = Number(req.params.rideId);
+  const isEnrolled = enrolledRideIds.includes(rideId);
+  console.log(`[REST] GET /api/enrollments/${rideId} → ${isEnrolled}`);
+  res.json({ rideId, enrolled: isEnrolled });
+});
+
+// Enroll in a ride
+app.post("/api/enrollments", (req: Request, res: Response) => {
+  const { rideId } = req.body as { rideId: number };
+  if (!rideId) {
+    res.status(400).json({ error: "rideId is required" });
+    return;
+  }
+  if (!enrolledRideIds.includes(rideId)) {
+    enrolledRideIds.push(rideId);
+    saveEnrollments(enrolledRideIds);
+    console.log(`[REST] POST /api/enrollments — enrolled in ride ${rideId}`);
+  }
+  res.json({ rideId, enrolled: true });
+});
+
+// Unenroll from a ride
+app.delete("/api/enrollments/:rideId", (req: Request, res: Response) => {
+  const rideId = Number(req.params.rideId);
+  enrolledRideIds = enrolledRideIds.filter((id) => id !== rideId);
+  saveEnrollments(enrolledRideIds);
+  console.log(`[REST] DELETE /api/enrollments/${rideId} — unenrolled`);
+  res.json({ rideId, enrolled: false });
+});
+
+// ── WebSocket — handles enrollment ──────────────────────────────────
 io.on("connection", (socket) => {
   console.log("[WS] Client connected:", socket.id);
 
-  // Client sends ENROLL with a ride id, server confirms
+  // Client sends ENROLL with a ride id, server persists and confirms
   socket.on("ENROLL", (data: { rideId: number }) => {
+    if (!enrolledRideIds.includes(data.rideId)) {
+      enrolledRideIds.push(data.rideId);
+      saveEnrollments(enrolledRideIds);
+    }
     console.log(`[WS] Client ${socket.id} enrolled in ride ${data.rideId}`);
     socket.emit("ENROLL_CONFIRMED", {
       rideId: data.rideId,
       message: "You have been enrolled in this ride!",
+    });
+  });
+
+  // Client sends UNENROLL with a ride id, server persists and confirms
+  socket.on("UNENROLL", (data: { rideId: number }) => {
+    enrolledRideIds = enrolledRideIds.filter((id) => id !== data.rideId);
+    saveEnrollments(enrolledRideIds);
+    console.log(`[WS] Client ${socket.id} unenrolled from ride ${data.rideId}`);
+    socket.emit("UNENROLL_CONFIRMED", {
+      rideId: data.rideId,
+      message: "You have been unenrolled from this ride.",
     });
   });
 
@@ -128,5 +212,6 @@ io.on("connection", (socket) => {
 httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`\nServer running on http://0.0.0.0:${PORT}`);
   console.log(`  REST API:  http://localhost:${PORT}/api/rides`);
+  console.log(`  Enrollments: http://localhost:${PORT}/api/enrollments`);
   console.log(`  WebSocket: ws://localhost:${PORT}\n`);
 });
