@@ -1,24 +1,45 @@
 // server.ts — Express REST API + Socket.io WebSocket server
+// Every ride belongs to a user. REST routes and socket connections require a JWT.
 
-import express, { Request, Response } from "express";
+import express, { NextFunction, Request, Response } from "express";
 import http from "http";
 import cors from "cors";
+import crypto from "crypto";
+import jwt from "jsonwebtoken";
 import { Server as SocketIOServer } from "socket.io";
 import { Pool } from "pg";
+
+type RideMode = "mtb" | "road" | "commuter";
+type RideStatus = "waiting" | "in_progress" | "completed";
 
 interface Ride {
   id: number;
   title: string;
-  mode: "mtb" | "road" | "commuter";
+  mode: RideMode;
   route: string;
   distance_km: number;
   riders: number;
   start_time: string;
-  status: "waiting" | "in_progress" | "completed";
+  status: RideStatus;
+  updated_at: string;
 }
 
-// ── Enrollment persistence ──────────────────────────────────────────
-// Enrolled ride IDs are stored in PostgreSQL so they survive app and server restarts.
+interface AuthUser {
+  userId: number;
+  username: string;
+}
+
+interface AuthRequest extends Request {
+  user?: AuthUser;
+}
+
+const MODES: RideMode[] = ["mtb", "road", "commuter"];
+const STATUSES: RideStatus[] = ["waiting", "in_progress", "completed"];
+
+const JWT_SECRET = process.env.JWT_SECRET || "ridecluj-dev-secret";
+const JWT_EXPIRES_IN = "7d";
+
+// ── Persistence (PostgreSQL) ────────────────────────────────────────
 
 const pool = new Pool({
   host: process.env.PGHOST || "localhost",
@@ -28,93 +49,119 @@ const pool = new Pool({
   password: process.env.PGPASSWORD || "password",
 });
 
-async function initDatabase(): Promise<void> {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS enrollments (
-      ride_id INTEGER PRIMARY KEY,
-      enrolled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
+// Passwords are stored as "salt:hash" using scrypt
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
 }
 
-async function getEnrollments(): Promise<number[]> {
-  const result = await pool.query<{ ride_id: number }>(
-    "SELECT ride_id FROM enrollments ORDER BY enrolled_at"
-  );
-  return result.rows.map((row) => row.ride_id);
+function verifyPassword(password: string, stored: string): boolean {
+  const [salt, hash] = stored.split(":");
+  const candidate = crypto.scryptSync(password, salt, 64);
+  return crypto.timingSafeEqual(candidate, Buffer.from(hash, "hex"));
 }
 
-async function isEnrolled(rideId: number): Promise<boolean> {
-  const result = await pool.query("SELECT 1 FROM enrollments WHERE ride_id = $1", [rideId]);
-  return (result.rowCount ?? 0) > 0;
-}
-
-async function enroll(rideId: number): Promise<void> {
-  await pool.query(
-    "INSERT INTO enrollments (ride_id) VALUES ($1) ON CONFLICT (ride_id) DO NOTHING",
-    [rideId]
-  );
-}
-
-async function unenroll(rideId: number): Promise<void> {
-  await pool.query("DELETE FROM enrollments WHERE ride_id = $1", [rideId]);
-}
-
-// Mock data
-const MOCK_RIDES: Ride[] = [
-  {
-    id: 1,
-    title: "Morning Faget MTB Loop",
-    mode: "mtb",
-    route: "Faget Forest → Cheile Baciului → Faget",
-    distance_km: 28.5,
-    riders: 6,
-    start_time: "2026-10-10T07:00:00Z",
-    status: "in_progress",
-  },
-  {
-    id: 2,
-    title: "Turda Gorge Road Ride",
-    mode: "road",
-    route: "Cluj-Napoca → Turda Gorge → Cluj-Napoca",
-    distance_km: 72.0,
-    riders: 12,
-    start_time: "2026-10-10T08:30:00Z",
-    status: "in_progress",
-  },
-  {
-    id: 3,
-    title: "City Center Commute Group",
-    mode: "commuter",
-    route: "Manastur → Piata Unirii",
-    distance_km: 5.2,
-    riders: 4,
-    start_time: "2026-10-10T07:45:00Z",
-    status: "waiting",
-  },
-  {
-    id: 4,
-    title: "Hoia Baciu Night Ride",
-    mode: "mtb",
-    route: "Hoia Forest Loop",
-    distance_km: 15.0,
-    riders: 8,
-    start_time: "2026-10-10T20:00:00Z",
-    status: "waiting",
-  },
-  {
-    id: 5,
-    title: "Somesul Mic Riverside Sprint",
-    mode: "road",
-    route: "Grigorescu → Floresti → Gilau",
-    distance_km: 34.0,
-    riders: 5,
-    start_time: "2026-10-10T09:00:00Z",
-    status: "in_progress",
-  },
+// Demo accounts, created on first start
+const SEED_USERS = [
+  { username: "bogdan", password: "bogdan123" },
+  { username: "ana", password: "ana123" },
 ];
 
-// Server setup
+const SEED_ROUTES: { title: string; mode: RideMode; route: string; distance_km: number }[] = [
+  { title: "Faget MTB Loop", mode: "mtb", route: "Faget Forest → Cheile Baciului → Faget", distance_km: 28.5 },
+  { title: "Turda Gorge Road Ride", mode: "road", route: "Cluj-Napoca → Turda Gorge → Cluj-Napoca", distance_km: 72 },
+  { title: "City Center Commute", mode: "commuter", route: "Manastur → Piata Unirii", distance_km: 5.2 },
+  { title: "Hoia Baciu Night Ride", mode: "mtb", route: "Hoia Forest Loop", distance_km: 15 },
+  { title: "Somesul Mic Riverside Sprint", mode: "road", route: "Grigorescu → Floresti → Gilau", distance_km: 34 },
+  { title: "Campus Commute", mode: "commuter", route: "Marasti → UBB Campus", distance_km: 4.1 },
+  { title: "Belis Lake Tour", mode: "road", route: "Cluj-Napoca → Gilau → Belis", distance_km: 96 },
+  { title: "Feleac Hill Climb", mode: "road", route: "Calea Turzii → Feleac", distance_km: 18.4 },
+];
+
+async function initDatabase(): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS rides (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      route TEXT NOT NULL,
+      distance_km REAL NOT NULL,
+      riders INTEGER NOT NULL,
+      start_time TIMESTAMPTZ NOT NULL,
+      status TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  for (const seed of SEED_USERS) {
+    const existing = await pool.query<{ id: number }>("SELECT id FROM users WHERE username = $1", [
+      seed.username,
+    ]);
+    if (existing.rowCount) continue;
+
+    const created = await pool.query<{ id: number }>(
+      "INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id",
+      [seed.username, hashPassword(seed.password)]
+    );
+    const userId = created.rows[0].id;
+
+    // 24 rides per user, so the list needs several pages
+    for (let i = 0; i < 24; i++) {
+      const base = SEED_ROUTES[i % SEED_ROUTES.length];
+      const day = String((i % 28) + 1).padStart(2, "0");
+      await pool.query(
+        `INSERT INTO rides (user_id, title, mode, route, distance_km, riders, start_time, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          userId,
+          `${base.title} #${i + 1} (${seed.username})`,
+          base.mode,
+          base.route,
+          base.distance_km,
+          2 + (i % 9),
+          `2026-11-${day}T0${7 + (i % 3)}:00:00Z`,
+          STATUSES[i % STATUSES.length],
+        ]
+      );
+    }
+    console.log(`[DB] Seeded user "${seed.username}" with 24 rides`);
+  }
+}
+
+const RIDE_COLUMNS = "id, title, mode, route, distance_km, riders, start_time, status, updated_at";
+
+function toRide(row: any): Ride {
+  return {
+    ...row,
+    distance_km: Number(row.distance_km),
+    start_time: new Date(row.start_time).toISOString(),
+    updated_at: new Date(row.updated_at).toISOString(),
+  };
+}
+
+// Returns an error message, or null when the body is a valid ride
+function validateRide(body: any): string | null {
+  if (!body || typeof body.title !== "string" || !body.title.trim()) return "title is required";
+  if (!MODES.includes(body.mode)) return "mode must be mtb, road or commuter";
+  if (typeof body.route !== "string" || !body.route.trim()) return "route is required";
+  if (!(Number(body.distance_km) > 0)) return "distance_km must be a positive number";
+  if (!Number.isInteger(Number(body.riders)) || Number(body.riders) < 0) return "riders must be a whole number";
+  if (isNaN(Date.parse(body.start_time))) return "start_time must be a date";
+  if (!STATUSES.includes(body.status)) return "status must be waiting, in_progress or completed";
+  return null;
+}
+
+// ── Server setup ────────────────────────────────────────────────────
+
 const PORT = Number(process.env.PORT) || 8080;
 
 const app = express();
@@ -126,122 +173,203 @@ const httpServer = http.createServer(app);
 const io = new SocketIOServer(httpServer, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST"],
+    methods: ["GET", "POST", "PUT"],
   },
 });
 
-// ── REST endpoints ──────────────────────────────────────────────────
+// Each user's sockets join their own room, so notifications reach only them
+const userRoom = (userId: number) => `user:${userId}`;
 
-app.get("/api/rides", (_req: Request, res: Response) => {
-  console.log("[REST] GET /api/rides");
-  res.json(MOCK_RIDES);
-});
+// ── Auth ────────────────────────────────────────────────────────────
 
-app.get("/api/rides/:id", (req: Request, res: Response) => {
-  const ride = MOCK_RIDES.find((r) => r.id === Number(req.params.id));
-  if (!ride) {
-    res.status(404).json({ error: "Ride not found" });
+app.post("/api/auth/login", async (req: Request, res: Response) => {
+  const { username, password } = (req.body ?? {}) as { username?: string; password?: string };
+  if (!username || !password) {
+    res.status(400).json({ error: "username and password are required" });
     return;
   }
-  res.json(ride);
+  try {
+    const result = await pool.query<{ id: number; username: string; password_hash: string }>(
+      "SELECT id, username, password_hash FROM users WHERE username = $1",
+      [username.trim().toLowerCase()]
+    );
+    const user = result.rows[0];
+    if (!user || !verifyPassword(password, user.password_hash)) {
+      res.status(401).json({ error: "Invalid username or password" });
+      return;
+    }
+    const token = jwt.sign({ userId: user.id, username: user.username }, JWT_SECRET, {
+      expiresIn: JWT_EXPIRES_IN,
+    });
+    console.log(`[AUTH] ${user.username} logged in`);
+    res.json({ token, username: user.username });
+  } catch (err) {
+    console.error("[DB] Login failed:", err);
+    res.status(500).json({ error: "Database error" });
+  }
 });
+
+function verifyToken(token: string | undefined): AuthUser | null {
+  if (!token) return null;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as AuthUser;
+    return { userId: payload.userId, username: payload.username };
+  } catch {
+    return null;
+  }
+}
+
+// Protects REST routes: requires "Authorization: Bearer <token>"
+function requireAuth(req: AuthRequest, res: Response, next: NextFunction): void {
+  const header = req.headers.authorization;
+  const token = header?.startsWith("Bearer ") ? header.slice(7) : undefined;
+  const user = verifyToken(token);
+  if (!user) {
+    res.status(401).json({ error: "Not authenticated" });
+    return;
+  }
+  req.user = user;
+  next();
+}
+
+// ── REST endpoints ──────────────────────────────────────────────────
 
 app.get("/api/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// ── Enrollment REST endpoints ───────────────────────────────────────
+// GET /api/rides?page=1&limit=10&q=faget&mode=mtb
+// Only the authenticated user's rides, newest first, one page at a time
+app.get("/api/rides", requireAuth, async (req: AuthRequest, res: Response) => {
+  const userId = req.user!.userId;
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 10));
+  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  const mode = typeof req.query.mode === "string" ? req.query.mode : "";
 
-// Get all enrolled ride IDs
-app.get("/api/enrollments", async (_req: Request, res: Response) => {
-  console.log("[REST] GET /api/enrollments");
+  const conditions = ["user_id = $1"];
+  const params: unknown[] = [userId];
+  if (q) {
+    params.push(`%${q}%`);
+    conditions.push(`(title ILIKE $${params.length} OR route ILIKE $${params.length})`);
+  }
+  if (MODES.includes(mode as RideMode)) {
+    params.push(mode);
+    conditions.push(`mode = $${params.length}`);
+  }
+  const where = conditions.join(" AND ");
+
   try {
-    res.json(await getEnrollments());
+    const total = await pool.query<{ count: string }>(`SELECT COUNT(*) FROM rides WHERE ${where}`, params);
+    const rows = await pool.query(
+      `SELECT ${RIDE_COLUMNS} FROM rides WHERE ${where}
+       ORDER BY id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, (page - 1) * limit]
+    );
+    const totalCount = Number(total.rows[0].count);
+    console.log(`[REST] GET /api/rides user=${req.user!.username} page=${page} q="${q}" mode="${mode}"`);
+    res.json({
+      items: rows.rows.map(toRide),
+      page,
+      limit,
+      total: totalCount,
+      hasMore: page * limit < totalCount,
+    });
   } catch (err) {
-    console.error("[DB] Failed to read enrollments:", err);
+    console.error("[DB] Failed to read rides:", err);
     res.status(500).json({ error: "Database error" });
   }
 });
 
-// Check if enrolled in a specific ride
-app.get("/api/enrollments/:rideId", async (req: Request, res: Response) => {
-  const rideId = Number(req.params.rideId);
+app.get("/api/rides/:id", requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const enrolled = await isEnrolled(rideId);
-    console.log(`[REST] GET /api/enrollments/${rideId} → ${enrolled}`);
-    res.json({ rideId, enrolled });
+    const result = await pool.query(`SELECT ${RIDE_COLUMNS} FROM rides WHERE id = $1 AND user_id = $2`, [
+      Number(req.params.id),
+      req.user!.userId,
+    ]);
+    if (!result.rowCount) {
+      res.status(404).json({ error: "Ride not found" });
+      return;
+    }
+    res.json(toRide(result.rows[0]));
   } catch (err) {
-    console.error("[DB] Failed to read enrollment:", err);
+    console.error("[DB] Failed to read ride:", err);
     res.status(500).json({ error: "Database error" });
   }
 });
 
-// Enroll in a ride
-app.post("/api/enrollments", async (req: Request, res: Response) => {
-  const { rideId } = req.body as { rideId: number };
-  if (!rideId) {
-    res.status(400).json({ error: "rideId is required" });
+app.post("/api/rides", requireAuth, async (req: AuthRequest, res: Response) => {
+  const error = validateRide(req.body);
+  if (error) {
+    res.status(400).json({ error });
     return;
   }
+  const b = req.body;
   try {
-    await enroll(rideId);
-    console.log(`[REST] POST /api/enrollments — enrolled in ride ${rideId}`);
-    res.json({ rideId, enrolled: true });
+    const result = await pool.query(
+      `INSERT INTO rides (user_id, title, mode, route, distance_km, riders, start_time, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING ${RIDE_COLUMNS}`,
+      [req.user!.userId, b.title.trim(), b.mode, b.route.trim(), Number(b.distance_km), Number(b.riders), b.start_time, b.status]
+    );
+    const ride = toRide(result.rows[0]);
+    console.log(`[REST] POST /api/rides user=${req.user!.username} → ride ${ride.id}`);
+    io.to(userRoom(req.user!.userId)).emit("RIDE_CREATED", ride);
+    res.status(201).json(ride);
   } catch (err) {
-    console.error("[DB] Failed to enroll:", err);
+    console.error("[DB] Failed to create ride:", err);
     res.status(500).json({ error: "Database error" });
   }
 });
 
-// Unenroll from a ride
-app.delete("/api/enrollments/:rideId", async (req: Request, res: Response) => {
-  const rideId = Number(req.params.rideId);
+app.put("/api/rides/:id", requireAuth, async (req: AuthRequest, res: Response) => {
+  const error = validateRide(req.body);
+  if (error) {
+    res.status(400).json({ error });
+    return;
+  }
+  const b = req.body;
   try {
-    await unenroll(rideId);
-    console.log(`[REST] DELETE /api/enrollments/${rideId} — unenrolled`);
-    res.json({ rideId, enrolled: false });
+    const result = await pool.query(
+      `UPDATE rides SET title = $1, mode = $2, route = $3, distance_km = $4, riders = $5,
+         start_time = $6, status = $7, updated_at = NOW()
+       WHERE id = $8 AND user_id = $9 RETURNING ${RIDE_COLUMNS}`,
+      [b.title.trim(), b.mode, b.route.trim(), Number(b.distance_km), Number(b.riders), b.start_time, b.status,
+        Number(req.params.id), req.user!.userId]
+    );
+    if (!result.rowCount) {
+      res.status(404).json({ error: "Ride not found" });
+      return;
+    }
+    const ride = toRide(result.rows[0]);
+    console.log(`[REST] PUT /api/rides/${ride.id} user=${req.user!.username}`);
+    io.to(userRoom(req.user!.userId)).emit("RIDE_UPDATED", ride);
+    res.json(ride);
   } catch (err) {
-    console.error("[DB] Failed to unenroll:", err);
+    console.error("[DB] Failed to update ride:", err);
     res.status(500).json({ error: "Database error" });
   }
 });
 
-// ── WebSocket — handles enrollment ──────────────────────────────────
+// ── Secured WebSocket ───────────────────────────────────────────────
+// The client passes its JWT in the handshake: io(url, { auth: { token } })
+
+io.use((socket, next) => {
+  const user = verifyToken(socket.handshake.auth?.token);
+  if (!user) {
+    next(new Error("Not authenticated"));
+    return;
+  }
+  socket.data.user = user;
+  next();
+});
+
 io.on("connection", (socket) => {
-  console.log("[WS] Client connected:", socket.id);
-
-  // Client sends ENROLL with a ride id, server persists and confirms
-  socket.on("ENROLL", async (data: { rideId: number }) => {
-    try {
-      await enroll(data.rideId);
-    } catch (err) {
-      console.error("[DB] Failed to enroll:", err);
-      return;
-    }
-    console.log(`[WS] Client ${socket.id} enrolled in ride ${data.rideId}`);
-    socket.emit("ENROLL_CONFIRMED", {
-      rideId: data.rideId,
-      message: "You have been enrolled in this ride!",
-    });
-  });
-
-  // Client sends UNENROLL with a ride id, server persists and confirms
-  socket.on("UNENROLL", async (data: { rideId: number }) => {
-    try {
-      await unenroll(data.rideId);
-    } catch (err) {
-      console.error("[DB] Failed to unenroll:", err);
-      return;
-    }
-    console.log(`[WS] Client ${socket.id} unenrolled from ride ${data.rideId}`);
-    socket.emit("UNENROLL_CONFIRMED", {
-      rideId: data.rideId,
-      message: "You have been unenrolled from this ride.",
-    });
-  });
+  const user = socket.data.user as AuthUser;
+  socket.join(userRoom(user.userId));
+  console.log(`[WS] ${user.username} connected (${socket.id})`);
 
   socket.on("disconnect", () => {
-    console.log("[WS] Client disconnected:", socket.id);
+    console.log(`[WS] ${user.username} disconnected (${socket.id})`);
   });
 });
 
@@ -251,9 +379,9 @@ initDatabase()
     console.log("[DB] Connected to PostgreSQL");
     httpServer.listen(PORT, "0.0.0.0", () => {
       console.log(`\nServer running on http://0.0.0.0:${PORT}`);
-      console.log(`  REST API:  http://localhost:${PORT}/api/rides`);
-      console.log(`  Enrollments: http://localhost:${PORT}/api/enrollments`);
-      console.log(`  WebSocket: ws://localhost:${PORT}\n`);
+      console.log(`  Login:     POST http://localhost:${PORT}/api/auth/login`);
+      console.log(`  REST API:  http://localhost:${PORT}/api/rides (needs Bearer token)`);
+      console.log(`  WebSocket: ws://localhost:${PORT} (needs token in handshake)\n`);
     });
   })
   .catch((err) => {
