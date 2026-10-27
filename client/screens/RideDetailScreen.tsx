@@ -1,211 +1,170 @@
-// RideDetailScreen.tsx — Detail screen
-// Shows ride info and an Enroll/Unenroll button that uses WebSocket.
-// Enrollment state is persisted locally with AsyncStorage and synced with the server.
+// RideDetailScreen.tsx — Detail screen: create a ride or edit an existing one.
+// Online it saves through REST; offline (or if REST fails) it saves on the phone.
 
-import React, { useEffect, useState, useRef, useCallback } from "react";
+import React, { useState } from "react";
 import {
   View,
   Text,
+  TextInput,
   Alert,
   TouchableOpacity,
   StyleSheet,
+  ScrollView,
   ActivityIndicator,
 } from "react-native";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import type { RootStackParamList } from "../App";
-import { io, Socket } from "socket.io-client";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-
-// Must match the backend server address
-const SERVER_URL = "http://192.168.0.59:8080";
-
-// AsyncStorage key prefix for enrollment state
-const ENROLLMENT_KEY_PREFIX = "@enrolled_ride_";
+import { useRides } from "../context/RidesContext";
+import type { RideMode, RideStatus } from "../types";
 
 type Props = NativeStackScreenProps<RootStackParamList, "RideDetail">;
 
-export default function RideDetailScreen({ route }: Props) {
+const MODES: RideMode[] = ["mtb", "road", "commuter"];
+const STATUSES: RideStatus[] = ["waiting", "in_progress", "completed"];
+
+// "2026-11-04T07:00:00.000Z" → "2026-11-04 07:00" (local time)
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function parseDate(text: string): string | null {
+  const match = text.trim().match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/);
+  if (!match) return null;
+  const [, y, mo, d, h, mi] = match.map(Number);
+  const date = new Date(y, mo - 1, d, h, mi);
+  return isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+export default function RideDetailScreen({ route, navigation }: Props) {
   const { ride } = route.params;
-  const [enrolled, setEnrolled] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const socketRef = useRef<Socket | null>(null);
+  const { saveRide, pending } = useRides();
 
-  // ── Load enrollment state on mount ──────────────────────────────
-  const loadEnrollmentState = useCallback(async () => {
+  const [title, setTitle] = useState(ride?.title ?? "");
+  const [routeText, setRouteText] = useState(ride?.route ?? "");
+  const [distance, setDistance] = useState(ride ? String(ride.distance_km) : "");
+  const [riders, setRiders] = useState(ride ? String(ride.riders) : "1");
+  const [start, setStart] = useState(formatDate(ride?.start_time ?? new Date().toISOString()));
+  const [mode, setMode] = useState<RideMode>(ride?.mode ?? "road");
+  const [status, setStatus] = useState<RideStatus>(ride?.status ?? "waiting");
+  const [saving, setSaving] = useState(false);
+
+  const isPending = ride !== undefined && pending.some((op) => op.ride.id === ride.id);
+
+  const handleSave = async () => {
+    const startTime = parseDate(start);
+    const distanceKm = Number(distance.replace(",", "."));
+    const ridersCount = Number(riders);
+    if (!title.trim() || !routeText.trim()) return Alert.alert("Missing data", "Title and route are required.");
+    if (!(distanceKm > 0)) return Alert.alert("Invalid distance", "Distance must be a positive number.");
+    if (!Number.isInteger(ridersCount) || ridersCount < 0) return Alert.alert("Invalid riders", "Riders must be a whole number.");
+    if (!startTime) return Alert.alert("Invalid start", "Use the format YYYY-MM-DD HH:MM.");
+
+    setSaving(true);
     try {
-      // 1. Check local cache first (instant)
-      const localValue = await AsyncStorage.getItem(
-        `${ENROLLMENT_KEY_PREFIX}${ride.id}`
+      const result = await saveRide(
+        {
+          title: title.trim(),
+          route: routeText.trim(),
+          distance_km: distanceKm,
+          riders: ridersCount,
+          start_time: startTime,
+          mode,
+          status,
+        },
+        ride?.id
       );
-      if (localValue === "true") {
-        setEnrolled(true);
+      if (result === "local") {
+        Alert.alert("Saved on the phone", "The server can't be reached. The ride will be sent automatically when you are back online.");
       }
-
-      // 2. Then sync with server (source of truth)
-      const response = await fetch(
-        `${SERVER_URL}/api/enrollments/${ride.id}`
-      );
-      if (response.ok) {
-        const data = await response.json();
-        setEnrolled(data.enrolled);
-        // Update local cache to match server
-        await AsyncStorage.setItem(
-          `${ENROLLMENT_KEY_PREFIX}${ride.id}`,
-          data.enrolled ? "true" : "false"
-        );
-      }
+      navigation.goBack();
     } catch (err) {
-      // If server is unreachable, local cache is still used
-      console.warn("Could not sync enrollment with server:", err);
-    } finally {
-      setLoading(false);
-    }
-  }, [ride.id]);
-
-  useEffect(() => {
-    loadEnrollmentState();
-  }, [loadEnrollmentState]);
-
-  // ── WebSocket connection ────────────────────────────────────────
-  useEffect(() => {
-    const socket = io(SERVER_URL, {
-      transports: ["websocket"],
-    });
-    socketRef.current = socket;
-
-    socket.on("ENROLL_CONFIRMED", async (data: { rideId: number; message: string }) => {
-      if (data.rideId === ride.id) {
-        setEnrolled(true);
-        await AsyncStorage.setItem(
-          `${ENROLLMENT_KEY_PREFIX}${ride.id}`,
-          "true"
-        );
-        Alert.alert("Enrolled", data.message);
-      }
-    });
-
-    socket.on("UNENROLL_CONFIRMED", async (data: { rideId: number; message: string }) => {
-      if (data.rideId === ride.id) {
-        setEnrolled(false);
-        await AsyncStorage.setItem(
-          `${ENROLLMENT_KEY_PREFIX}${ride.id}`,
-          "false"
-        );
-        Alert.alert("Unenrolled", data.message);
-      }
-    });
-
-    return () => {
-      socket.disconnect();
-    };
-  }, [ride.id]);
-
-  // ── Handlers ────────────────────────────────────────────────────
-  const handleEnroll = () => {
-    if (socketRef.current) {
-      socketRef.current.emit("ENROLL", { rideId: ride.id });
+      Alert.alert("Could not save", err instanceof Error ? err.message : "Unknown error");
+      setSaving(false);
     }
   };
-
-  const handleUnenroll = () => {
-    if (socketRef.current) {
-      socketRef.current.emit("UNENROLL", { rideId: ride.id });
-    }
-  };
-
-  if (loading) {
-    return (
-      <View style={[styles.container, styles.centered]}>
-        <ActivityIndicator size="large" color="#4ecca3" />
-      </View>
-    );
-  }
 
   return (
-    <View style={styles.container}>
+    <ScrollView style={styles.container} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+      {isPending && <Text style={styles.pendingNote}>This ride has changes not sent to the server yet.</Text>}
+
       <View style={styles.card}>
-        <Text style={styles.title}>{ride.title}</Text>
-        <Row label="Mode" value={ride.mode} />
-        <Row label="Route" value={ride.route} />
-        <Row label="Distance" value={`${ride.distance_km} km`} />
-        <Row label="Riders" value={`${ride.riders}`} />
-        <Row label="Status" value={ride.status.replace("_", " ")} />
-        <Row label="Start" value={new Date(ride.start_time).toLocaleTimeString()} />
+        <Field label="Title" value={title} onChangeText={setTitle} />
+        <Field label="Route" value={routeText} onChangeText={setRouteText} />
+        <Field label="Distance (km)" value={distance} onChangeText={setDistance} keyboardType="decimal-pad" />
+        <Field label="Riders" value={riders} onChangeText={setRiders} keyboardType="number-pad" />
+        <Field label="Start (YYYY-MM-DD HH:MM)" value={start} onChangeText={setStart} />
+
+        <Text style={styles.label}>Mode</Text>
+        <Choice options={MODES} value={mode} onChange={setMode} />
+        <Text style={styles.label}>Status</Text>
+        <Choice options={STATUSES} value={status} onChange={setStatus} />
       </View>
 
-      <TouchableOpacity
-        style={[styles.enrollButton, enrolled && styles.enrolledButton]}
-        onPress={enrolled ? handleUnenroll : handleEnroll}
-      >
-        <Text style={styles.enrollButtonText}>
-          {enrolled ? "Unenroll" : "Enroll"}
-        </Text>
+      <TouchableOpacity style={styles.saveButton} onPress={handleSave} disabled={saving}>
+        {saving ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveButtonText}>{ride ? "Save changes" : "Create ride"}</Text>}
       </TouchableOpacity>
+    </ScrollView>
+  );
+}
+
+function Field(props: {
+  label: string;
+  value: string;
+  onChangeText: (text: string) => void;
+  keyboardType?: "default" | "decimal-pad" | "number-pad";
+}) {
+  return (
+    <View style={styles.field}>
+      <Text style={styles.label}>{props.label}</Text>
+      <TextInput
+        style={styles.input}
+        value={props.value}
+        onChangeText={props.onChangeText}
+        keyboardType={props.keyboardType ?? "default"}
+        placeholderTextColor="#666"
+      />
     </View>
   );
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+function Choice<T extends string>({ options, value, onChange }: { options: T[]; value: T; onChange: (v: T) => void }) {
   return (
-    <View style={styles.row}>
-      <Text style={styles.label}>{label}</Text>
-      <Text style={styles.value}>{value}</Text>
+    <View style={styles.choices}>
+      {options.map((option) => (
+        <TouchableOpacity
+          key={option}
+          style={[styles.chip, value === option && styles.chipActive]}
+          onPress={() => onChange(option)}
+        >
+          <Text style={[styles.chipText, value === option && styles.chipTextActive]}>{option.replace("_", " ")}</Text>
+        </TouchableOpacity>
+      ))}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#121212",
-    padding: 16,
-  },
-  centered: {
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  card: {
-    backgroundColor: "#1e1e1e",
-    borderRadius: 16,
-    padding: 20,
-    marginBottom: 20,
-  },
-  title: {
-    fontSize: 20,
-    fontWeight: "700",
-    color: "#e0e0e0",
-    marginBottom: 16,
-  },
-  row: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: "#2a2a2a",
-  },
-  label: {
-    fontSize: 14,
-    color: "#888",
-  },
-  value: {
-    fontSize: 14,
-    fontWeight: "500",
-    color: "#e0e0e0",
-    textTransform: "capitalize",
-  },
-  enrollButton: {
+  container: { flex: 1, backgroundColor: "#121212" },
+  content: { padding: 16 },
+  pendingNote: { color: "#f0b35b", marginBottom: 12 },
+  card: { backgroundColor: "#1e1e1e", borderRadius: 16, padding: 20, marginBottom: 20 },
+  field: { marginBottom: 12 },
+  label: { fontSize: 13, color: "#888", marginBottom: 6 },
+  input: {
     backgroundColor: "#2a2a2a",
-    paddingVertical: 14,
-    borderRadius: 16,
-    alignItems: "center",
+    color: "#e0e0e0",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 15,
   },
-  enrolledButton: {
-    backgroundColor: "#4ecca3",
-  },
-  enrollButtonText: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "600",
-  },
+  choices: { flexDirection: "row", flexWrap: "wrap", marginBottom: 12 },
+  chip: { backgroundColor: "#2a2a2a", borderRadius: 14, paddingHorizontal: 12, paddingVertical: 6, marginRight: 8, marginBottom: 6 },
+  chipActive: { backgroundColor: "#4ecca3" },
+  chipText: { color: "#aaa", fontSize: 13, textTransform: "capitalize" },
+  chipTextActive: { color: "#fff", fontWeight: "600" },
+  saveButton: { backgroundColor: "#4ecca3", paddingVertical: 14, borderRadius: 16, alignItems: "center" },
+  saveButtonText: { color: "#fff", fontSize: 16, fontWeight: "600" },
 });
-
