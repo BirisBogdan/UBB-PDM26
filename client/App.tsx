@@ -1,4 +1,5 @@
 // App.tsx — Providers and navigation. The login screen is shown only when no token is saved.
+// The screen transitions override the native stack's default animations (see screenOptions).
 
 import React from "react";
 import { ActivityIndicator, StyleSheet, Text, TouchableOpacity, View } from "react-native";
@@ -9,15 +10,19 @@ import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import LoginScreen from "./screens/LoginScreen";
 import RideListScreen from "./screens/RideListScreen";
 import RideDetailScreen from "./screens/RideDetailScreen";
+import MapScreen from "./screens/MapScreen";
+import { PulseDot } from "./components/Animated";
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import { NetworkProvider, useOnline } from "./context/NetworkContext";
 import { RidesProvider } from "./context/RidesContext";
-import type { Ride } from "./types";
+import type { Coordinates, Ride } from "./types";
 
 export type RootStackParamList = {
   Login: undefined;
   RideList: undefined;
-  RideDetail: { ride?: Ride }; // no ride = create a new one
+  RideDetail: { ride?: Ride; pickedLocation?: Coordinates }; // no ride = create a new one
+  // pick: choose the ride's location and send it back; view: show where the ride is
+  Map: { mode: "pick" | "view"; location?: Coordinates; title?: string };
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -26,7 +31,7 @@ export function NetworkBadge() {
   const online = useOnline();
   return (
     <View style={styles.badge}>
-      <View style={[styles.dot, { backgroundColor: online ? "#4ecca3" : "#e94560" }]} />
+      <PulseDot active={!online} style={[styles.dot, { backgroundColor: online ? "#4ecca3" : "#e94560" }]} />
       <Text style={styles.badgeText}>{online ? "Online" : "Offline"}</Text>
     </View>
   );
@@ -61,6 +66,9 @@ function RootNavigator() {
         headerStyle: { backgroundColor: "#121212" },
         headerTintColor: "#fff",
         contentStyle: { backgroundColor: "#121212" },
+        // Overrides the platform's default push animation for every screen
+        animation: "ios_from_right",
+        animationDuration: 300,
       }}
     >
       {token ? (
@@ -68,7 +76,13 @@ function RootNavigator() {
           <Stack.Screen
             name="RideList"
             component={RideListScreen}
-            options={{ title: username ?? "Rides", headerRight: () => <HeaderRight /> }}
+            options={{
+              title: username ?? "Rides",
+              headerRight: () => <HeaderRight />,
+              // Login → list: cross-fade instead of the default push
+              animation: "fade",
+              animationTypeForReplace: "push",
+            }}
           />
           <Stack.Screen
             name="RideDetail"
@@ -76,6 +90,19 @@ function RootNavigator() {
             options={({ route }) => ({
               title: route.params.ride ? "Edit ride" : "New ride",
               headerRight: () => <NetworkBadge />,
+              // The edit page slides up like a sheet instead of in from the side
+              animation: "slide_from_bottom",
+              animationDuration: 350,
+            })}
+          />
+          <Stack.Screen
+            name="Map"
+            component={MapScreen}
+            options={({ route }) => ({
+              title: route.params.mode === "pick" ? "Pick the location" : route.params.title ?? "Ride location",
+              animation: "fade_from_bottom",
+              // Dragging on the map must move the map, not close the screen
+              gestureEnabled: false,
             })}
           />
         </>
@@ -83,7 +110,13 @@ function RootNavigator() {
         <Stack.Screen
           name="Login"
           component={LoginScreen}
-          options={{ title: "RideCluj", headerRight: () => <NetworkBadge /> }}
+          options={{
+            title: "RideCluj",
+            headerRight: () => <NetworkBadge />,
+            // Logout: the login screen fades in and the replace animates like going back
+            animation: "fade",
+            animationTypeForReplace: "pop",
+          }}
         />
       )}
     </Stack.Navigator>

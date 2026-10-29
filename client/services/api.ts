@@ -1,5 +1,6 @@
 // api.ts — REST calls to the backend, always with the JWT
 
+import { File, UploadType } from "expo-file-system";
 import { SERVER_URL } from "../config";
 import type { Ride, RideInput } from "../types";
 
@@ -53,4 +54,25 @@ export function createRide(token: string, ride: RideInput) {
 
 export function updateRide(token: string, id: number, ride: RideInput) {
   return request<Ride>(`/api/rides/${id}`, token, { method: "PUT", body: JSON.stringify(ride) });
+}
+
+// Sends the photo saved on the phone as the request body (expo-file-system upload).
+// Rejects with a plain Error when the server can't be reached, so it stays queued.
+export async function uploadPhoto(token: string, id: number, localUri: string) {
+  const file = new File(localUri);
+  if (!file.exists) throw new ClientError("The photo is no longer on the phone");
+  const result = await file.upload(`${SERVER_URL}/api/rides/${id}/photo`, {
+    httpMethod: "POST",
+    uploadType: UploadType.BINARY_CONTENT,
+    mimeType: "image/jpeg",
+    headers: { "Content-Type": "image/jpeg", Authorization: `Bearer ${token}` },
+  });
+  let body: any = {};
+  try {
+    body = JSON.parse(result.body);
+  } catch {}
+  if (result.status === 401) throw new AuthError(body.error ?? "Not authenticated");
+  if (result.status >= 400 && result.status < 500) throw new ClientError(body.error ?? `Status ${result.status}`);
+  if (result.status >= 300) throw new Error(body.error ?? `Status ${result.status}`);
+  return body as Ride;
 }

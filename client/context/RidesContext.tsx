@@ -1,5 +1,6 @@
 // RidesContext.tsx — Rides of the logged-in user: local cache, offline queue,
-// automatic sync when back online, and live updates over the secured socket
+// automatic sync when back online, live updates over the secured socket,
+// and ride photos: saved on the phone first, uploaded when the server is reachable
 
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -21,7 +22,8 @@ interface RidesState {
   pending: PendingOp[];
   syncing: boolean;
   loadPage: (page: number, limit: number, q: string, mode: string) => Promise<RidePage>;
-  saveRide: (input: RideInput, id?: number) => Promise<"server" | "local">;
+  // photo: a new photo saved on the phone (file:// uri) that should be uploaded
+  saveRide: (input: RideInput, id?: number, photo?: string) => Promise<"server" | "local">;
   syncPending: () => Promise<void>;
   subscribe: (listener: (event: RideEvent) => void) => () => void;
 }
@@ -40,8 +42,16 @@ export function matchesFilter(ride: Ride, q: string, mode: string): boolean {
 }
 
 function toInput(ride: Ride): RideInput {
-  const { id, updated_at, ...input } = ride;
+  const { id, updated_at, photo_url, local_photo, ...input } = ride;
   return input;
+}
+
+// Rides from the server don't know about the copy of the photo on this phone,
+// so keep it as long as it is still the same photo the server has
+function mergeLocal(incoming: Ride, existing?: Ride): Ride {
+  if (incoming.local_photo !== undefined || !existing?.local_photo) return incoming;
+  const samePhoto = !incoming.photo_url || incoming.photo_url === existing.photo_url;
+  return samePhoto ? { ...incoming, local_photo: existing.local_photo } : incoming;
 }
 
 export function RidesProvider({ children }: { children: React.ReactNode }) {
@@ -87,11 +97,14 @@ export function RidesProvider({ children }: { children: React.ReactNode }) {
     return raw ? JSON.parse(raw) : [];
   };
 
-  const cacheRides = async (rides: Ride[]) => {
-    if (!usernameRef.current || rides.length === 0) return;
+  // Saves the rides and returns them with their local photo filled in
+  const cacheRides = async (rides: Ride[]): Promise<Ride[]> => {
+    if (!usernameRef.current || rides.length === 0) return rides;
     const byId = new Map((await readCache()).map((r) => [r.id, r]));
-    rides.forEach((r) => byId.set(r.id, r));
+    const merged = rides.map((r) => mergeLocal(r, byId.get(r.id)));
+    merged.forEach((r) => byId.set(r.id, r));
     await AsyncStorage.setItem(cacheKey(usernameRef.current), JSON.stringify([...byId.values()]));
+    return merged;
   };
 
   const handleError = (err: unknown) => {
@@ -103,8 +116,8 @@ export function RidesProvider({ children }: { children: React.ReactNode }) {
     try {
       if (!tokenRef.current) throw new AuthError("Not logged in");
       const result = await api.getRides(tokenRef.current, page, limit, q, mode);
-      await cacheRides(result.items);
-      return { items: result.items, hasMore: result.hasMore, fromCache: false };
+      const items = await cacheRides(result.items);
+      return { items, hasMore: result.hasMore, fromCache: false };
     } catch (err) {
       handleError(err);
       if (err instanceof AuthError) throw err;
@@ -126,12 +139,25 @@ export function RidesProvider({ children }: { children: React.ReactNode }) {
       while (pendingRef.current.length > 0) {
         const op = pendingRef.current[0];
         try {
-          const saved =
-            op.type === "create"
-              ? await api.createRide(tokenRef.current!, toInput(op.ride))
-              : await api.updateRide(tokenRef.current!, op.ride.id, toInput(op.ride));
-          await cacheRides([saved]);
-          emit(op.type === "create" ? { type: "replace", localId: op.ride.id, ride: saved } : { type: "upsert", ride: saved });
+          if (op.type === "photo") {
+            const uploaded = await api.uploadPhoto(tokenRef.current!, op.ride.id, op.photo!);
+            const [ride] = await cacheRides([{ ...uploaded, local_photo: op.photo }]);
+            emit({ type: "upsert", ride });
+          } else {
+            const saved =
+              op.type === "create"
+                ? await api.createRide(tokenRef.current!, toInput(op.ride))
+                : await api.updateRide(tokenRef.current!, op.ride.id, toInput(op.ride));
+            const [ride] = await cacheRides([{ ...saved, local_photo: op.ride.local_photo }]);
+            emit(op.type === "create" ? { type: "replace", localId: op.ride.id, ride } : { type: "upsert", ride });
+            if (op.photo) {
+              // The ride is on the server now; only its photo is left. If the upload
+              // fails, the ride is not created a second time on the next sync.
+              const photoOp: PendingOp = { type: "photo", ride, photo: op.photo, savedAt: op.savedAt };
+              await writePending(pendingRef.current.map((o) => (o === op ? photoOp : o)));
+              continue;
+            }
+          }
         } catch (err) {
           handleError(err);
           // Server unreachable: keep the change and try again later.
@@ -148,32 +174,58 @@ export function RidesProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // Online: try REST first. Offline or REST failed: keep it on the phone.
-  const saveRide = useCallback(async (input: RideInput, id?: number): Promise<"server" | "local"> => {
+  const saveRide = useCallback(async (input: RideInput, id?: number, photo?: string): Promise<"server" | "local"> => {
     const isLocalOnly = id !== undefined && id < 0;
+    const queued = pendingRef.current.find((o) => o.ride.id === id);
     if (onlineRef.current && !isLocalOnly && tokenRef.current) {
+      let saved: Ride | null = null;
       try {
-        const saved = id === undefined ? await api.createRide(tokenRef.current, input) : await api.updateRide(tokenRef.current, id, input);
-        await cacheRides([saved]);
+        saved = id === undefined ? await api.createRide(tokenRef.current, input) : await api.updateRide(tokenRef.current, id, input);
+        [saved] = await cacheRides([{ ...saved, local_photo: photo }]);
         // A newer version reached the server, so an older queued update is not needed
-        if (pendingRef.current.some((o) => o.ride.id === saved.id)) {
-          await writePending(pendingRef.current.filter((o) => o.ride.id !== saved.id));
+        if (pendingRef.current.some((o) => o.ride.id === saved!.id)) {
+          await writePending(pendingRef.current.filter((o) => o.ride.id !== saved!.id));
+        }
+        // A new photo, or one an older queued change still had to upload
+        const toUpload = photo ?? queued?.photo;
+        if (toUpload) {
+          [saved] = await cacheRides([{ ...(await api.uploadPhoto(tokenRef.current, saved.id, toUpload)), local_photo: toUpload }]);
         }
         emit({ type: "upsert", ride: saved });
         return "server";
       } catch (err) {
         handleError(err);
+        if (saved) {
+          // The ride itself was saved; only the photo upload failed
+          emit({ type: "upsert", ride: saved });
+          if (err instanceof AuthError) throw err;
+          if (err instanceof ClientError) throw new Error(`The ride was saved, but the photo was rejected: ${err.message}`);
+          const photoOp: PendingOp = { type: "photo", ride: saved, photo: photo ?? queued?.photo, savedAt: new Date().toISOString() };
+          await writePending([...pendingRef.current, photoOp]);
+          return "local";
+        }
         if (err instanceof AuthError || err instanceof ClientError) throw err;
         // Network error or server down: fall through and store locally
       }
     }
 
-    const ride: Ride = { ...input, id: id ?? -Date.now() };
+    // Keep the photo the ride already had (on the server or on the phone)
+    const previous = queued?.ride ?? (id === undefined ? undefined : (await readCache()).find((r) => r.id === id));
+    const ride: Ride = {
+      ...input,
+      id: id ?? -Date.now(),
+      photo_url: previous?.photo_url ?? null,
+      local_photo: photo ?? previous?.local_photo ?? null,
+    };
     const existing = pendingRef.current.findIndex((o) => o.ride.id === ride.id);
     const next = [...pendingRef.current];
+    const savedAt = new Date().toISOString();
     if (existing >= 0) {
-      next[existing] = { ...next[existing], ride, savedAt: new Date().toISOString() };
+      const old = next[existing];
+      // A queued photo upload becomes a full update, since the ride changed too
+      next[existing] = { type: old.type === "photo" ? "update" : old.type, ride, photo: photo ?? old.photo, savedAt };
     } else {
-      next.push({ type: id === undefined ? "create" : "update", ride, savedAt: new Date().toISOString() });
+      next.push({ type: id === undefined ? "create" : "update", ride, photo, savedAt });
     }
     await writePending(next);
 
@@ -216,8 +268,8 @@ export function RidesProvider({ children }: { children: React.ReactNode }) {
     });
 
     const onRide = async (ride: Ride) => {
-      await cacheRides([ride]);
-      emit({ type: "upsert", ride });
+      const [merged] = await cacheRides([ride]);
+      emit({ type: "upsert", ride: merged });
     };
     socket.on("RIDE_CREATED", onRide);
     socket.on("RIDE_UPDATED", onRide);

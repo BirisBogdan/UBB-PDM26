@@ -24,3 +24,6 @@ npm-debug.log*
 
 # Server data (enrollment persistence)
 server/data/
+
+# Ride photos uploaded to the server
+server/uploads/

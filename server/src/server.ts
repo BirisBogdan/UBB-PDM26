@@ -5,6 +5,8 @@ import express, { NextFunction, Request, Response } from "express";
 import http from "http";
 import cors from "cors";
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import jwt from "jsonwebtoken";
 import { Server as SocketIOServer } from "socket.io";
 import { Pool } from "pg";
@@ -21,6 +23,9 @@ interface Ride {
   riders: number;
   start_time: string;
   status: RideStatus;
+  photo_url: string | null; // e.g. "/uploads/ride-12-1730000000000.jpg"
+  latitude: number | null;
+  longitude: number | null;
   updated_at: string;
 }
 
@@ -68,16 +73,21 @@ const SEED_USERS = [
   { username: "ana", password: "ana123" },
 ];
 
-const SEED_ROUTES: { title: string; mode: RideMode; route: string; distance_km: number }[] = [
-  { title: "Faget MTB Loop", mode: "mtb", route: "Faget Forest → Cheile Baciului → Faget", distance_km: 28.5 },
-  { title: "Turda Gorge Road Ride", mode: "road", route: "Cluj-Napoca → Turda Gorge → Cluj-Napoca", distance_km: 72 },
-  { title: "City Center Commute", mode: "commuter", route: "Manastur → Piata Unirii", distance_km: 5.2 },
-  { title: "Hoia Baciu Night Ride", mode: "mtb", route: "Hoia Forest Loop", distance_km: 15 },
-  { title: "Somesul Mic Riverside Sprint", mode: "road", route: "Grigorescu → Floresti → Gilau", distance_km: 34 },
-  { title: "Campus Commute", mode: "commuter", route: "Marasti → UBB Campus", distance_km: 4.1 },
-  { title: "Belis Lake Tour", mode: "road", route: "Cluj-Napoca → Gilau → Belis", distance_km: 96 },
-  { title: "Feleac Hill Climb", mode: "road", route: "Calea Turzii → Feleac", distance_km: 18.4 },
+// lat/lng is the meeting point of the ride
+const SEED_ROUTES: { title: string; mode: RideMode; route: string; distance_km: number; lat: number; lng: number }[] = [
+  { title: "Faget MTB Loop", mode: "mtb", route: "Faget Forest → Cheile Baciului → Faget", distance_km: 28.5, lat: 46.7334, lng: 23.5653 },
+  { title: "Turda Gorge Road Ride", mode: "road", route: "Cluj-Napoca → Turda Gorge → Cluj-Napoca", distance_km: 72, lat: 46.7600, lng: 23.5800 },
+  { title: "City Center Commute", mode: "commuter", route: "Manastur → Piata Unirii", distance_km: 5.2, lat: 46.7558, lng: 23.5506 },
+  { title: "Hoia Baciu Night Ride", mode: "mtb", route: "Hoia Forest Loop", distance_km: 15, lat: 46.7745, lng: 23.5300 },
+  { title: "Somesul Mic Riverside Sprint", mode: "road", route: "Grigorescu → Floresti → Gilau", distance_km: 34, lat: 46.7712, lng: 23.5560 },
+  { title: "Campus Commute", mode: "commuter", route: "Marasti → UBB Campus", distance_km: 4.1, lat: 46.7801, lng: 23.6150 },
+  { title: "Belis Lake Tour", mode: "road", route: "Cluj-Napoca → Gilau → Belis", distance_km: 96, lat: 46.7700, lng: 23.5650 },
+  { title: "Feleac Hill Climb", mode: "road", route: "Calea Turzii → Feleac", distance_km: 18.4, lat: 46.7466, lng: 23.5937 },
 ];
+
+// Ride photos are saved here and served at /uploads/<file>
+const UPLOADS_DIR = path.join(__dirname, "..", "uploads");
+const MAX_PHOTO_SIZE = "15mb";
 
 async function initDatabase(): Promise<void> {
   await pool.query(`
@@ -101,6 +111,13 @@ async function initDatabase(): Promise<void> {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  // Iteration 3: photo and location, added to databases created by earlier iterations
+  await pool.query(`
+    ALTER TABLE rides
+      ADD COLUMN IF NOT EXISTS photo_url TEXT,
+      ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION
+  `);
 
   for (const seed of SEED_USERS) {
     const existing = await pool.query<{ id: number }>("SELECT id FROM users WHERE username = $1", [
@@ -119,8 +136,8 @@ async function initDatabase(): Promise<void> {
       const base = SEED_ROUTES[i % SEED_ROUTES.length];
       const day = String((i % 28) + 1).padStart(2, "0");
       await pool.query(
-        `INSERT INTO rides (user_id, title, mode, route, distance_km, riders, start_time, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        `INSERT INTO rides (user_id, title, mode, route, distance_km, riders, start_time, status, latitude, longitude)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
         [
           userId,
           `${base.title} #${i + 1} (${seed.username})`,
@@ -130,19 +147,32 @@ async function initDatabase(): Promise<void> {
           2 + (i % 9),
           `2026-11-${day}T0${7 + (i % 3)}:00:00Z`,
           STATUSES[i % STATUSES.length],
+          base.lat,
+          base.lng,
         ]
       );
     }
     console.log(`[DB] Seeded user "${seed.username}" with 24 rides`);
   }
+
+  // Seeded rides from earlier iterations get their meeting point too
+  for (const base of SEED_ROUTES) {
+    await pool.query(
+      "UPDATE rides SET latitude = $1, longitude = $2 WHERE latitude IS NULL AND title LIKE $3",
+      [base.lat, base.lng, `${base.title} #%`]
+    );
+  }
 }
 
-const RIDE_COLUMNS = "id, title, mode, route, distance_km, riders, start_time, status, updated_at";
+const RIDE_COLUMNS =
+  "id, title, mode, route, distance_km, riders, start_time, status, photo_url, latitude, longitude, updated_at";
 
 function toRide(row: any): Ride {
   return {
     ...row,
     distance_km: Number(row.distance_km),
+    latitude: row.latitude === null ? null : Number(row.latitude),
+    longitude: row.longitude === null ? null : Number(row.longitude),
     start_time: new Date(row.start_time).toISOString(),
     updated_at: new Date(row.updated_at).toISOString(),
   };
@@ -157,7 +187,18 @@ function validateRide(body: any): string | null {
   if (!Number.isInteger(Number(body.riders)) || Number(body.riders) < 0) return "riders must be a whole number";
   if (isNaN(Date.parse(body.start_time))) return "start_time must be a date";
   if (!STATUSES.includes(body.status)) return "status must be waiting, in_progress or completed";
+  // Location is optional, but latitude and longitude come together
+  const hasLat = body.latitude !== undefined && body.latitude !== null;
+  const hasLng = body.longitude !== undefined && body.longitude !== null;
+  if (hasLat !== hasLng) return "latitude and longitude must be sent together";
+  if (hasLat && !(Math.abs(Number(body.latitude)) <= 90)) return "latitude must be between -90 and 90";
+  if (hasLng && !(Math.abs(Number(body.longitude)) <= 180)) return "longitude must be between -180 and 180";
   return null;
+}
+
+// null when the ride has no location
+function coordinate(value: unknown): number | null {
+  return value === undefined || value === null ? null : Number(value);
 }
 
 // ── Server setup ────────────────────────────────────────────────────
@@ -167,6 +208,8 @@ const PORT = Number(process.env.PORT) || 8080;
 const app = express();
 app.use(cors());
 app.use(express.json());
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+app.use("/uploads", express.static(UPLOADS_DIR));
 
 const httpServer = http.createServer(app);
 
@@ -307,9 +350,10 @@ app.post("/api/rides", requireAuth, async (req: AuthRequest, res: Response) => {
   const b = req.body;
   try {
     const result = await pool.query(
-      `INSERT INTO rides (user_id, title, mode, route, distance_km, riders, start_time, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING ${RIDE_COLUMNS}`,
-      [req.user!.userId, b.title.trim(), b.mode, b.route.trim(), Number(b.distance_km), Number(b.riders), b.start_time, b.status]
+      `INSERT INTO rides (user_id, title, mode, route, distance_km, riders, start_time, status, latitude, longitude)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING ${RIDE_COLUMNS}`,
+      [req.user!.userId, b.title.trim(), b.mode, b.route.trim(), Number(b.distance_km), Number(b.riders), b.start_time, b.status,
+        coordinate(b.latitude), coordinate(b.longitude)]
     );
     const ride = toRide(result.rows[0]);
     console.log(`[REST] POST /api/rides user=${req.user!.username} → ride ${ride.id}`);
@@ -331,10 +375,10 @@ app.put("/api/rides/:id", requireAuth, async (req: AuthRequest, res: Response) =
   try {
     const result = await pool.query(
       `UPDATE rides SET title = $1, mode = $2, route = $3, distance_km = $4, riders = $5,
-         start_time = $6, status = $7, updated_at = NOW()
-       WHERE id = $8 AND user_id = $9 RETURNING ${RIDE_COLUMNS}`,
+         start_time = $6, status = $7, latitude = $8, longitude = $9, updated_at = NOW()
+       WHERE id = $10 AND user_id = $11 RETURNING ${RIDE_COLUMNS}`,
       [b.title.trim(), b.mode, b.route.trim(), Number(b.distance_km), Number(b.riders), b.start_time, b.status,
-        Number(req.params.id), req.user!.userId]
+        coordinate(b.latitude), coordinate(b.longitude), Number(req.params.id), req.user!.userId]
     );
     if (!result.rowCount) {
       res.status(404).json({ error: "Ride not found" });
@@ -349,6 +393,52 @@ app.put("/api/rides/:id", requireAuth, async (req: AuthRequest, res: Response) =
     res.status(500).json({ error: "Database error" });
   }
 });
+
+// POST /api/rides/:id/photo — the body is the image itself (Content-Type: image/jpeg).
+// The phone sends it with expo-file-system's File.upload after the ride is saved.
+app.post(
+  "/api/rides/:id/photo",
+  requireAuth,
+  express.raw({ type: "image/*", limit: MAX_PHOTO_SIZE }),
+  async (req: AuthRequest, res: Response) => {
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      res.status(400).json({ error: "The body must be an image (Content-Type: image/jpeg or image/png)" });
+      return;
+    }
+    const id = Number(req.params.id);
+    try {
+      const existing = await pool.query<{ photo_url: string | null }>(
+        "SELECT photo_url FROM rides WHERE id = $1 AND user_id = $2",
+        [id, req.user!.userId]
+      );
+      if (!existing.rowCount) {
+        res.status(404).json({ error: "Ride not found" });
+        return;
+      }
+
+      const extension = req.headers["content-type"] === "image/png" ? "png" : "jpg";
+      const fileName = `ride-${id}-${Date.now()}.${extension}`;
+      await fs.promises.writeFile(path.join(UPLOADS_DIR, fileName), req.body);
+
+      const result = await pool.query(
+        `UPDATE rides SET photo_url = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3 RETURNING ${RIDE_COLUMNS}`,
+        [`/uploads/${fileName}`, id, req.user!.userId]
+      );
+
+      // The previous photo of this ride is not needed anymore
+      const oldPhoto = existing.rows[0].photo_url;
+      if (oldPhoto) fs.promises.unlink(path.join(UPLOADS_DIR, path.basename(oldPhoto))).catch(() => {});
+
+      const ride = toRide(result.rows[0]);
+      console.log(`[REST] POST /api/rides/${id}/photo user=${req.user!.username} (${req.body.length} bytes)`);
+      io.to(userRoom(req.user!.userId)).emit("RIDE_UPDATED", ride);
+      res.json(ride);
+    } catch (err) {
+      console.error("[DB] Failed to save photo:", err);
+      res.status(500).json({ error: "Could not save the photo" });
+    }
+  }
+);
 
 // ── Secured WebSocket ───────────────────────────────────────────────
 // The client passes its JWT in the handshake: io(url, { auth: { token } })

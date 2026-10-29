@@ -1,6 +1,8 @@
 // RideListScreen.tsx — Master screen
 // Infinite scroll over the user's rides, with search, a mode filter and
-// a banner for changes not yet sent to the server.
+// a banner for changes not yet sent to the server. Each ride shows its photo
+// and, when it has a location, a button that opens it on the map.
+// Items fade/slide in as they appear and squeeze when pressed.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -17,6 +19,8 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import type { RootStackParamList } from "../App";
 import { matchesFilter, useRides } from "../context/RidesContext";
 import { useOnline } from "../context/NetworkContext";
+import { photoUri } from "../services/photos";
+import { FadeInImage, FadeInView, ScalePressable } from "../components/Animated";
 import type { Ride } from "../types";
 
 const PAGE_SIZE = 8;
@@ -124,7 +128,7 @@ export default function RideListScreen({ navigation }: Props) {
   const displayed = useMemo(() => {
     let list = rides;
     for (const op of pending) {
-      if (op.type === "update" && !list.some((r) => r.id === op.ride.id)) continue;
+      if (op.type !== "create" && !list.some((r) => r.id === op.ride.id)) continue;
       if (op.type === "create" && !matchesFilter(op.ride, query, mode)) continue;
       list = upsert(list, op.ride);
     }
@@ -155,7 +159,7 @@ export default function RideListScreen({ navigation }: Props) {
       </View>
 
       {pending.length > 0 && (
-        <View style={styles.pendingBanner}>
+        <FadeInView style={styles.pendingBanner} distance={-12}>
           <Text style={styles.pendingText}>
             {syncing
               ? "Sending changes to the server…"
@@ -166,7 +170,7 @@ export default function RideListScreen({ navigation }: Props) {
               <Text style={styles.pendingAction}>Retry</Text>
             </TouchableOpacity>
           )}
-        </View>
+        </FadeInView>
       )}
       {fromCache && <Text style={styles.cacheNote}>Server unreachable, showing saved rides</Text>}
 
@@ -185,30 +189,55 @@ export default function RideListScreen({ navigation }: Props) {
           ListFooterComponent={
             loadingMore ? <ActivityIndicator style={styles.footer} color="#aaa" /> : undefined
           }
-          renderItem={({ item }) => (
-            <TouchableOpacity
-              style={[styles.item, pendingIds.has(item.id) && styles.itemPending]}
-              onPress={() => navigation.navigate("RideDetail", { ride: item })}
-              activeOpacity={0.7}
-            >
-              <View style={styles.itemHeader}>
-                <Text style={styles.itemTitle}>{item.title}</Text>
-                {pendingIds.has(item.id) && <Text style={styles.pendingTag}>Not synced</Text>}
-              </View>
-              <Text style={styles.itemSub}>
-                {item.route} — {item.distance_km} km — {item.riders} riders
-              </Text>
-              <Text style={styles.itemStatus}>
-                {item.mode} · {item.status.replace("_", " ")}
-              </Text>
-            </TouchableOpacity>
-          )}
+          renderItem={({ item, index }) => {
+            const photo = photoUri(item);
+            const hasLocation = item.latitude != null && item.longitude != null;
+            return (
+              // Items of the same page come in one after another
+              <FadeInView delay={(index % PAGE_SIZE) * 60}>
+                <ScalePressable
+                  style={[styles.item, pendingIds.has(item.id) && styles.itemPending]}
+                  onPress={() => navigation.navigate("RideDetail", { ride: item })}
+                  scaleTo={0.97}
+                >
+                  {photo && <FadeInImage uri={photo} style={styles.itemPhoto} />}
+                  <View style={styles.itemHeader}>
+                    <Text style={styles.itemTitle}>{item.title}</Text>
+                    {pendingIds.has(item.id) && <Text style={styles.pendingTag}>Not synced</Text>}
+                  </View>
+                  <Text style={styles.itemSub}>
+                    {item.route} — {item.distance_km} km — {item.riders} riders
+                  </Text>
+                  <View style={styles.itemFooter}>
+                    <Text style={styles.itemStatus}>
+                      {item.mode} · {item.status.replace("_", " ")}
+                    </Text>
+                    {hasLocation && (
+                      <ScalePressable
+                        style={styles.mapButton}
+                        hitSlop={8}
+                        onPress={() =>
+                          navigation.navigate("Map", {
+                            mode: "view",
+                            location: { latitude: item.latitude!, longitude: item.longitude! },
+                            title: item.title,
+                          })
+                        }
+                      >
+                        <Text style={styles.mapButtonText}>Map</Text>
+                      </ScalePressable>
+                    )}
+                  </View>
+                </ScalePressable>
+              </FadeInView>
+            );
+          }}
         />
       )}
 
-      <TouchableOpacity style={styles.fab} onPress={() => navigation.navigate("RideDetail", {})}>
+      <ScalePressable style={styles.fab} scaleTo={0.85} onPress={() => navigation.navigate("RideDetail", {})}>
         <Text style={styles.fabText}>+</Text>
-      </TouchableOpacity>
+      </ScalePressable>
     </View>
   );
 }
@@ -255,6 +284,10 @@ const styles = StyleSheet.create({
   pendingTag: { color: "#f0b35b", fontSize: 11, fontWeight: "600", marginLeft: 8 },
   itemSub: { fontSize: 13, color: "#888", marginBottom: 2 },
   itemStatus: { fontSize: 12, color: "#666", textTransform: "capitalize" },
+  itemPhoto: { width: "100%", height: 120, borderRadius: 12, marginBottom: 10, backgroundColor: "#2a2a2a" },
+  itemFooter: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  mapButton: { backgroundColor: "#2a2a2a", borderRadius: 10, paddingHorizontal: 10, paddingVertical: 4 },
+  mapButtonText: { color: "#4ecca3", fontSize: 12, fontWeight: "600" },
   fab: {
     position: "absolute",
     right: 20,

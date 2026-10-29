@@ -19,7 +19,20 @@
       }
     },
     "plugins": [
-      "expo-asset"
+      "expo-asset",
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "RideCluj uses the camera to take a photo of a ride.",
+          "photosPermission": "RideCluj lets you pick a ride photo from your gallery."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "RideCluj uses your location to pick and find ride meeting points."
+        }
+      ]
     ]
   }
 }
